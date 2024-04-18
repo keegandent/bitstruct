@@ -113,17 +113,27 @@ class _Float(_Info):
 
 class _Raw(_Info):
 
-    def pack(self, arg):
-        number_of_padding_bytes = ((self.size - 8 * len(arg)) // 8)
-        arg += (number_of_padding_bytes * b'\x00')
+    def __init__(self, size, name, align_right):
+        super().__init__(size, name)
+        self.align_right = align_right
+        self.number_of_padding_bits = (8 - (self.size % 8)) % 8
 
-        return bin(int(b'01' + binascii.hexlify(arg), 16))[3:self.size + 3]
+    def pack(self, arg):
+        number_of_padding_bytes = max(((self.size - 8 * len(arg)) // 8), 0)
+        if self.align_right:
+            arg = number_of_padding_bytes * b'\x00' + arg
+            return bin(int(b'01' + binascii.hexlify(arg), 16))[-self.size:]
+        else:
+            arg += number_of_padding_bytes * b'\x00'
+            return bin(int(b'01' + binascii.hexlify(arg), 16))[3:self.size + 3]
+
+
 
     def unpack(self, bits):
-        rest = self.size % 8
-
-        if rest > 0:
-            bits += (8 - rest) * '0'
+        if self.align_right:
+            bits = self.number_of_padding_bits * '0' + bits
+        else:
+            bits += self.number_of_padding_bits * '0'
 
         return binascii.unhexlify(hex(int('10000000' + bits, 2))[4:].rstrip('L'))
 
@@ -147,23 +157,29 @@ class _OnePadding(_Padding):
 
 class _Text(_Info):
 
-    def __init__(self, size, name, encoding, errors):
+    def __init__(self, size, name, encoding, errors, align_right):
         super().__init__(size, name)
         self.encoding = encoding
         self.errors = errors
+        self.align_right = align_right
 
     def pack(self, arg):
         encoded = arg.encode('utf-8')
         number_of_padding_bytes = ((self.size - 8 * len(encoded)) // 8)
-        encoded += (number_of_padding_bytes * b'\x00')
+        if self.align_right:
+            encoded = number_of_padding_bytes * b'\x00' + encoded
+        else:
+            encoded += number_of_padding_bytes * b'\x00'
 
-        return _pack_bytearray(self.size, encoded)
+        return _pack_bytearray(self.size, encoded, self.align_right)
 
     def unpack(self, bits):
-        return _unpack_bytearray(self.size, bits).decode(self.encoding, self.errors)
+        return _unpack_bytearray(self.size,
+                                 bits,
+                                 self.align_right).decode(self.encoding, self.errors)
 
 
-def _parse_format(fmt, names, text_encoding, text_errors):
+def _parse_format(fmt, names, text_encoding, text_errors, align_right):
     if fmt and fmt[-1] in '><':
         byte_order = fmt[-1]
         fmt = fmt[:-1]
@@ -209,10 +225,10 @@ def _parse_format(fmt, names, text_encoding, text_errors):
             info = _Boolean(size, name)
             i += 1
         elif type_ == 't':
-            info = _Text(size, name, text_encoding, text_errors)
+            info = _Text(size, name, text_encoding, text_errors, align_right)
             i += 1
         elif type_ == 'r':
-            info = _Raw(size, name)
+            info = _Raw(size, name, align_right)
             i += 1
         elif type_ == 'p':
             info = _ZeroPadding(size)
@@ -228,15 +244,20 @@ def _parse_format(fmt, names, text_encoding, text_errors):
     return infos, byte_order or '>'
 
 
-def _pack_bytearray(size, arg):
-    return bin(int(b'01' + binascii.hexlify(arg), 16))[3:size + 3]
+def _pack_bytearray(size, arg, align_right=False):
+    if align_right:
+        return bin(int(b'01' + binascii.hexlify(arg), 16))[-size:]
+    else:
+        return bin(int(b'01' + binascii.hexlify(arg), 16))[3:size + 3]
 
 
-def _unpack_bytearray(size, bits):
-    rest = size % 8
+def _unpack_bytearray(size, bits, align_right=False):
+    num_padding_bits = (8 - (size % 8)) % 8
 
-    if rest > 0:
-        bits += (8 - rest) * '0'
+    if align_right > 0:
+        bits = num_padding_bits * '0' + bits
+    else:
+        bits += num_padding_bits * '0'
 
     return binascii.unhexlify(hex(int('10000000' + bits, 2))[4:].rstrip('L'))
 
@@ -247,11 +268,14 @@ class _CompiledFormat:
                  fmt,
                  names=None,
                  text_encoding='utf-8',
-                 text_errors='strict'):
-        infos, byte_order = _parse_format(fmt, names, text_encoding, text_errors)
+                 text_errors='strict',
+                 align_right=False):
+        infos, byte_order = _parse_format(fmt, names, text_encoding, text_errors, align_right)
         self._infos = infos
         self._byte_order = byte_order
         self._number_of_bits_to_unpack = sum([info.size for info in infos])
+        self._align_right = align_right
+
 
     def pack_value(self, info, value, bits):
         value_bits = info.pack(value)
@@ -284,13 +308,15 @@ class _CompiledFormat:
             else:
                 bits = self.pack_value(info, values[info.name], bits)
 
-        # Padding of last byte.
-        tail = len(bits) % 8
+        # Padding of last (or first) byte.
+        num_pad = (8 - len(bits) % 8) % 8
+        if self._align_right:
+            bits = num_pad * '0' + bits
+        else:
+            bits += num_pad * '0'
 
-        if tail != 0:
-            bits += (8 - tail) * '0'
 
-        return bytes(_unpack_bytearray(len(bits), bits))
+        return bytes(_unpack_bytearray(len(bits), bits, self._align_right))
 
     def unpack_from_any(self, data, offset, allow_truncated):
         bits = bin(int(b'01' + binascii.hexlify(data), 16))[3 + offset:]
@@ -302,15 +328,23 @@ class _CompiledFormat:
                     self._number_of_bits_to_unpack,
                     len(bits)))
 
-        offset = 0
 
-        for info in self._infos:
-            if offset + info.size > len(bits):
+        q = []
+        if self._align_right:
+            offset = len(bits)
+            dir = -1
+        else:
+            offset = 0
+            dir = 1
+
+        for info in self._infos[::dir]:
+            extent = offset + info.size * dir
+            if extent > len(bits) or extent < 0:
                 # Stop unpacking if we ran out of bytes to
                 # unpack. Note that this condition will never trigger
                 # if `allow_truncated` is not `True` because of the
                 # sanity check above.
-                return
+                break
 
             if isinstance(info, _Padding):
                 pass
@@ -318,9 +352,9 @@ class _CompiledFormat:
                 # Reverse bytes order for least significant byte
                 # first.
                 if self._byte_order == ">" or isinstance(info, (_Raw, _Text)):
-                    value_bits = bits[offset:offset + info.size]
+                    value_bits = bits[min(offset, extent):max(offset, extent)]
                 else:
-                    value_bits_tmp = bits[offset:offset + info.size]
+                    value_bits_tmp = bits[min(offset, extent):max(offset, extent)]
                     aligned_offset = (info.size - ((offset + info.size) % 8))
                     value_bits = ''
 
@@ -335,9 +369,12 @@ class _CompiledFormat:
                 if info.endianness == "<":
                     value_bits = value_bits[::-1]
 
-                yield info, info.unpack(value_bits)
+                q.append((info, info.unpack(value_bits)))
 
-            offset += info.size
+            offset = extent
+
+        for info, value in q[::dir]:
+            yield info, value
 
     def pack_into_any(self, buf, offset, data, **kwargs):
         fill_padding = kwargs.get('fill_padding', True)
@@ -359,7 +396,7 @@ class _CompiledFormat:
             raise Error(
                 f'pack_into requires a buffer of at least {len(bits)} bits')
 
-        buf[:] = _unpack_bytearray(len(bits), bits)
+        buf[:] = _unpack_bytearray(len(bits), bits, self._align_right)
 
     def calcsize(self):
         """Return the number of bits in the compiled format string.
@@ -378,8 +415,8 @@ class CompiledFormat(_CompiledFormat):
 
     """
 
-    def __init__(self, fmt, text_encoding='utf-8', text_errors='strict'):
-        super().__init__(fmt, None, text_encoding, text_errors)
+    def __init__(self, fmt, text_encoding='utf-8', text_errors='strict', align_right=False):
+        super().__init__(fmt, None, text_encoding, text_errors, align_right)
         self._number_of_arguments = 0
 
         for info in self._infos:
@@ -425,6 +462,8 @@ class CompiledFormat(_CompiledFormat):
         """See :func:`~bitstruct.unpack_from()`.
 
         """
+        if allow_truncated and self._align_right:
+            raise Error("cannot allow for truncated unpack with align_right")
 
         return tuple([v[1] for v in self.unpack_from_any(
             data, offset, allow_truncated=allow_truncated)])
@@ -471,7 +510,7 @@ class CompiledFormatDict(_CompiledFormat):
                 data, offset, allow_truncated=allow_truncated)}
 
 
-def pack(fmt, *args):
+def pack(fmt, *args, **kwargs):
     """Return a bytes object containing the values v1, v2, ... packed
     according to given format string `fmt`. If the total number of
     bits are not a multiple of 8, padding will be added at the end of
@@ -520,14 +559,17 @@ def pack(fmt, *args):
 
     """
 
-    return CompiledFormat(fmt).pack(*args)
+    align_right = kwargs.get('align_right', False)
+
+    return CompiledFormat(fmt, align_right=align_right).pack(*args)
 
 
 def unpack(fmt,
            data,
            allow_truncated=False,
            text_encoding='utf-8',
-           text_errors='strict'):
+           text_errors='strict',
+           align_right=False):
     """Unpack `data` (bytes or bytearray) according to given format string
     `fmt`.
 
@@ -542,7 +584,7 @@ def unpack(fmt,
 
     """
 
-    return CompiledFormat(fmt, text_encoding, text_errors).unpack(
+    return CompiledFormat(fmt, text_encoding, text_errors, align_right).unpack(
         data, allow_truncated=allow_truncated)
 
 
@@ -554,10 +596,12 @@ def pack_into(fmt, buf, offset, *args, **kwargs):
 
     """
 
-    return CompiledFormat(fmt).pack_into(buf,
-                                         offset,
-                                         *args,
-                                         **kwargs)
+    align_right = kwargs.get('align_right', False)
+
+    return CompiledFormat(fmt, align_right=align_right).pack_into(buf,
+                                                                  offset,
+                                                                  *args,
+                                                                  **kwargs)
 
 
 def unpack_from(fmt,
@@ -565,7 +609,8 @@ def unpack_from(fmt,
                 offset=0,
                 allow_truncated=False,
                 text_encoding='utf-8',
-                text_errors='strict'):
+                text_errors='strict',
+                align_right=False):
     """Unpack `data` (bytes or bytearray) according to given format string
     `fmt`, starting at given bit offset `offset`. If `allow_truncated`
     is `True`, `data` may be shorter than the number of items
@@ -575,11 +620,11 @@ def unpack_from(fmt,
 
     """
 
-    return CompiledFormat(fmt, text_encoding, text_errors).unpack_from(
+    return CompiledFormat(fmt, text_encoding, text_errors, align_right).unpack_from(
         data, offset, allow_truncated=allow_truncated)
 
 
-def pack_dict(fmt, names, data):
+def pack_dict(fmt, names, data, align_right=False):
     """Same as :func:`~bitstruct.pack()`, but data is read from a
     dictionary.
 
@@ -591,7 +636,7 @@ def pack_dict(fmt, names, data):
 
     """
 
-    return CompiledFormatDict(fmt, names).pack(data)
+    return CompiledFormatDict(fmt, names, align_right=align_right).pack(data)
 
 
 def unpack_dict(fmt,
@@ -599,7 +644,8 @@ def unpack_dict(fmt,
                 data,
                 allow_truncated=False,
                 text_encoding='utf-8',
-                text_errors='strict'):
+                text_errors='strict',
+                align_right=False):
     """Same as :func:`~bitstruct.unpack()`, but returns a dictionary.
 
     See :func:`~bitstruct.pack_dict()` for details on `names`.
@@ -609,7 +655,7 @@ def unpack_dict(fmt,
 
     """
 
-    return CompiledFormatDict(fmt, names, text_encoding, text_errors).unpack(
+    return CompiledFormatDict(fmt, names, text_encoding, text_errors, align_right).unpack(
         data, allow_truncated=allow_truncated)
 
 
@@ -621,10 +667,12 @@ def pack_into_dict(fmt, names, buf, offset, data, **kwargs):
 
     """
 
-    return CompiledFormatDict(fmt, names).pack_into(buf,
-                                                    offset,
-                                                    data,
-                                                    **kwargs)
+    align_right = kwargs.get('align_right', False)
+
+    return CompiledFormatDict(fmt, names, align_right=align_right).pack_into(buf,
+                                                                             offset,
+                                                                             data,
+                                                                             **kwargs)
 
 
 def unpack_from_dict(fmt,
@@ -633,7 +681,8 @@ def unpack_from_dict(fmt,
                      offset=0,
                      allow_truncated=False,
                      text_encoding='utf-8',
-                     text_errors='strict'):
+                     text_errors='strict',
+                     align_right=False):
     """Same as :func:`~bitstruct.unpack_from()`, but returns a
     dictionary.
 
@@ -641,7 +690,7 @@ def unpack_from_dict(fmt,
 
     """
 
-    return CompiledFormatDict(fmt, names, text_encoding, text_errors).unpack_from(
+    return CompiledFormatDict(fmt, names, text_encoding, text_errors, align_right).unpack_from(
         data, offset, allow_truncated=allow_truncated)
 
 
@@ -679,7 +728,8 @@ def byteswap(fmt, data, offset=0):
 def compile(fmt,
             names=None,
             text_encoding='utf-8',
-            text_errors='strict'):
+            text_errors='strict',
+            align_right=False):
     """Compile given format string `fmt` and return a compiled format
     object that can be used to pack and/or unpack data multiple times.
 
@@ -695,6 +745,6 @@ def compile(fmt,
     """
 
     if names is None:
-        return CompiledFormat(fmt, text_encoding, text_errors)
+        return CompiledFormat(fmt, text_encoding, text_errors, align_right)
     else:
-        return CompiledFormatDict(fmt, names, text_encoding, text_errors)
+        return CompiledFormatDict(fmt, names, text_encoding, text_errors, align_right)
